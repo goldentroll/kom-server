@@ -1,0 +1,230 @@
+
+from typing import Dict, List, Optional, Union
+import kom as k
+import torch 
+import traceback
+import json
+
+
+
+
+class ServerHTTP(k.Module):
+    def __init__(
+        self,
+        module: Union[k.Module, object],
+        name: str = None,
+        network:str = 'local',
+        port: Optional[int] = None,
+        sse: bool = True,
+        chunk_size: int = 42_000,
+        max_request_staleness: int = 60, 
+        max_workers: int = None,
+        mode:str = 'thread',
+        verbose: bool = False,
+        timeout: int = 256,
+        access_module: str = 'server.access',
+        public: bool = False,
+        ) -> 'Server':
+        
+        self.serializer = k.module('serializer')()
+        self.ip = k.default_ip # default to '0.0.0.0'
+        self.port = int(port) if port != None else k.free_port()
+        self.address = f"{self.ip}:{self.port}"
+        self.max_request_staleness = max_request_staleness
+        self.chunk_size = chunk_size
+        self.network = network
+        self.verbose = verbose
+
+        # executro 
+        self.sse = sse
+        if self.sse == False:
+            self.max_workers = max_workers
+            self.mode = mode
+            self.executor = k.executor(max_workers=max_workers, mode=mode)
+        self.timeout = timeout
+        self.public = public
+
+        if name == None:
+            if hasattr(module, 'server_name'):
+                name = module.server_name
+            else:
+                name = module.__class__.__name__
+        
+        self.module = module 
+        k.print(self.module, type(self.module), module.key)
+        self.key = module.key      
+        # register the server
+        self.name = name
+        module.ip = self.ip
+        module.port = self.port
+        module.address  = self.address
+
+        if not hasattr(module, 'access_module'):
+            self.access_module = k.module(access_module)(module=module)
+        else:
+            self.access_module = module.access_module
+        k.print('fam')
+
+        self.set_api(ip=self.ip, port=self.port)
+
+
+
+    def set_api(self, ip = None, port = None):
+        ip = self.ip if ip == None else ip
+        port = self.port if port == None else port
+        from fastapi import FastAPI
+        from fastapi.middleware.cors import CORSMiddleware
+
+        self.app = FastAPI()
+        self.app.add_middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+
+
+        @self.app.post("/{fn}")
+        async def forward_api(fn:str, input:dict):
+            try:
+
+                input['fn'] = fn
+
+                input = self.process_input(input)
+
+                data = input['data']
+                args = data.get('args',[])
+                kwargs = data.get('kwargs', {})
+                
+                input_kwargs = dict(fn=fn, args=args, kwargs=kwargs)
+                fn_name = f"{self.name}::{fn}"
+                k.print(f'🚀 Forwarding {input["address"]} --> {fn_name} 🚀\033', color='yellow')
+
+                result = self.forward(**input_kwargs)
+                # if the result is a future, we need to wait for it to finish
+                if isinstance(result, dict) and 'error' in result:
+                    success = False 
+                success = True
+            except Exception as e:
+                success = False
+                result = k.detailed_error(e)
+
+            if success:
+                k.print(f'✅ Success: {self.name}::{fn} --> {input["address"]}... ✅\033 ', color='green')
+            else:
+                k.print(f'🚨 Error: {self.name}::{fn} --> {input["address"]}... 🚨\033', color='red')
+            result = self.process_result(result)
+            k.print(result)
+            return result
+        
+        self.serve()
+        
+        
+
+    def state_dict(self) -> Dict:
+        return {
+            'ip': self.ip,
+            'port': self.port,
+            'address': self.address,
+        }
+
+
+    def test(self):
+        r"""Test the HTTP server.
+        """
+        # Test the server here if needed
+        k.print(self.state_dict(), color='green')
+        return self
+
+    
+    def process_input(self,input: dict) -> bool:
+        assert 'data' in input, f"Data not included"
+        assert 'signature' in input, f"Data not signed"
+        # you can verify the input with the server key class
+        if not self.public:
+            assert self.key.verify(input), f"Data not signed with correct key"
+        input['data'] = self.serializer.deserialize(input['data'])
+        # here we want to verify the data is signed with the correct key
+        request_staleness = k.timestamp() - input['data'].get('timestamp', 0)
+        # verifty the request is not too old
+        assert request_staleness < self.max_request_staleness, f"Request is too old, {request_staleness} > MAX_STALENESS ({self.max_request_staleness})  seconds old"
+
+        self.access_module.verify(input)
+
+        return input
+
+
+    def process_result(self,  result):
+        if self.sse:
+            # for sse we want to wrap the generator in an eventsource response
+            from sse_starlette.sse import EventSourceResponse
+            result = self.generator_wrapper(result)
+            return EventSourceResponse(result)
+        else:
+            # if we are not using sse, then we can do this with json
+            if k.is_generator(result):
+                result = list(result)
+            result = self.serializer.serialize({'data': result})
+            result = self.key.sign(result, return_json=True)
+            return result
+        
+    
+    def generator_wrapper(self, generator):
+        if not k.is_generator(generator):   
+            generator = [generator]
+            
+        for item in generator:
+            # we wrap the item in a json object, just like the serializer does
+            item = self.serializer.serialize({'data': item})
+            item = self.key.sign(item, return_json=True)
+            item = json.dumps(item)
+            item_size = k.sizeof(item)
+            if item_size > self.chunk_size:
+                # if the item is too big, we need to chunk it
+                item_hash = k.hash(item)
+                chunks =[f'CHUNKSTART:{item_hash}'] + [item[i:i+self.chunk_size] for i in range(0, item_size, self.chunk_size)] + [f'CHUNKEND:{item_hash}']
+                # we need to yield the chunks in a format that the eventsource response can understand
+                for chunk in chunks:
+                    yield chunk
+
+            yield item
+
+
+    def serve(self, **kwargs):
+        import uvicorn
+
+        try:
+            k.print(f'\033🚀 Serving {self.name} on {self.address} 🚀\033')
+            k.register_server(name=self.name, address = self.address, network=self.network)
+            k.print(f'\033🚀 Registered {self.name} on {self.ip}:{self.port} 🚀\033')
+            uvicorn.run(self.app, host=k.default_ip, port=self.port)
+        except Exception as e:
+            k.print(e, color='red')
+            k.deregister_server(self.name, network=self.network)
+        finally:
+            k.deregister_server(self.name, network=self.network)
+        
+
+    def forward(self, fn: str, args: List = None, kwargs: Dict = None, **extra_kwargs):
+        if args is None:
+            args = []
+        if kwargs is None:
+            kwargs = {}
+        obj = getattr(self.module, fn)
+        if callable(obj):
+            response = obj(*args, **kwargs)
+        else:
+            response = obj
+
+        return response
+
+
+    def __del__(self):
+        k.deregister_server(self.name)
+
+
+
+    def test(self):
+        k.serve('storage')
+
